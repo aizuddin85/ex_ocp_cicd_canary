@@ -90,7 +90,7 @@ podTemplate(
             imageTagger("${projectDevNamespc}/${appNameDev}:${devTag}", "${projectDevNamespc}/${appNameDev}:latest", "${projectDevNamespc}")
          }
 
-    // STAGE 11: Create new-app ** Figure out how to know last deployment??// 
+    // STAGE 11: Create new-app 
           stage("Rolling out deployment"){
             appCheck = sh(returnStdout: true, script: "oc get dc ${appNameDev} -o jsonpath='{ .metadata.name }' -n ${projectDevNamespc} || true").trim()
 
