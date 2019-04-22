@@ -1,0 +1,309 @@
+/**
+AUTHOR: Muhammad Aizuddin Zali <mzali@redhat.com>
+DATE: 22 April 2019
+LOCATION: KLIA, Sepang, Selangor, Malaysia.
+
+README:
+This is an example of dev to production with canary testing and also a rollback example. In this example, difference between old and new deployment was
+just an image change. When more complex requirement needed like config change etc. Templating is the better option. 
+
+Also noticed, that this pipeline is 'scripted pipeline' just to show the underlying working component and each command used. For advanced
+usage, use 'declarative pipeline' with OpenShift plugin.
+
+LICENSE:
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+you may obtain a copy of the License at
+http://www.apache.org/licenses/LICENSE-2.0
+
+**/
+podTemplate(
+  label: "skopeo-pod",
+  cloud: "openshift",
+  inheritFrom: "maven",
+  containers: [
+    containerTemplate(
+      name: "jnlp",
+      image: "docker-registry.default.svc:5000/devsecops/jenkins-slave-appdev",
+      resourceRequestMemory: "1Gi",
+      resourceLimitMemory: "2Gi"
+    )
+  ]
+) {
+    // STAGE 1: Spawn Jenkins`s slave node called skopeo-pod that has maven and skopeo // 
+    node('skopeo-pod'){
+   
+    // STAGE 2: Defined variables here //
+        def mvnCmd              = "mvn -s ../nexus_settings.xml"
+        def gitUrl              = "http://gogs.apps.local.topimerah.net/mzali/hello-undertow"
+        def gitRef              = "master"
+        def sonarUrl            = "http://sonarqube-devsecops.apps.local.topimerah.net/"
+        def nexusRelUrl         = "http://nexus.devsecops.svc.cluster.local:8081/repository/releases"
+        def nexusRepUrl         = "${nexusRelUrl}/org/openshift/quickstarts/undertow"
+        def mavenMirrorUrl      = "http://nexus.devsecops.svc.cluster.local:8081/repository/maven-all-public"
+        def projectDevNamespc   = "undertow-servlet-dev"    // Developement namespace
+        def projectPrdNamespc   = "undertow-servlet-prd"    // Production / Canary namespace
+        def appNameDev          = "hello-undertow-dev"      // Development application name
+        def appNameCan          = "hello-undertow-can"      // Canary applicationname
+        def appNamePrd          = "hello-undertow-prd"      // Production application name
+        
+
+
+    // STAGE 3: Checking out source code tree //
+        stage("Checking out source code"){
+            git branch: "${gitRef}", changelog: false, poll: false, url: "${gitUrl}"
+        }
+ 
+    // STAGE 4: Switch working directory to workspace containing pom.xml for maven build //     
+        dir("servlet"){
+
+    // STAGE 5: Using defined function (at bottom of this pipeline), read pom.xml and set all variables //
+          def groupId         = getGroupIdFromPom("pom.xml")
+          def artifactId      = getArtifactIdFromPom("pom.xml")
+          def version         = getVersionFromPom("pom.xml")
+          def devTag          = "${version}-${BUILD_NUMBER}"
+          def prodTag         = "${version}"
+
+    // STAGE 6: Start building target //
+          stage("Building target"){
+            sh "${mvnCmd} clean package -DskipTests -Dcom.redhat.xpaas.repo.redhatga -Dfabric8.skip=true --batch-mode -Djava.net.preferIPv4Stack=true"
+          } 
+
+    // STAGE 7: Send code for static analysis using sonarque //
+          stage("Code Analysis"){
+            sh "${mvnCmd} sonar:sonar -Dsonar.host.url=${sonarUrl} -Dsonar.projectName=${artifactId} -Dcom.redhat.xpaas.repo.redhatga"
+          }
+
+    // STAGE 8: Send built artifact into nexus repo as release //
+          stage("Publishing artifacts"){
+            sh "${mvnCmd}  deploy -DskipTests=true -DaltDeploymentRepository=nexus::default::${nexusRelUrl}"
+          }
+
+    // STAGE 9: Configure new-build //
+          stage("Creating new OpenShift build object"){
+            sh "oc new-build  -e MAVEN_MIRROR_URL=${mavenMirrorUrl}  --name=${appNameDev}-${BUILD_NUMBER} --binary=true java:8 --to=${projectDevNamespc}/${appNameDev}:${devTag} -n ${projectDevNamespc}"
+          }
+
+    // STAGE 10: Start a new-build //
+          stage("Starting to build and marked image as latest build"){
+            sh "oc start-build ${appNameDev}-${BUILD_NUMBER} --follow --from-file=${nexusRepUrl}/${artifactId}/${version}/${artifactId}-${version}.jar -n ${projectDevNamespc}"
+            imageTagger("${projectDevNamespc}/${appNameDev}:${devTag}", "${projectDevNamespc}/${appNameDev}:latest", "${projectDevNamespc}")
+         }
+
+    // STAGE 11: Create new-app ** Figure out how to know last deployment??// 
+          stage("Rolling out deployment"){
+            appCheck = sh(returnStdout: true, script: "oc get dc ${appNameDev} -o jsonpath='{ .metadata.name }' -n ${projectDevNamespc} || true").trim()
+
+            if (appCheck == "") { 
+              echo "${appNameDev} not deployed. Creating new deployment..."
+              // No latest deployment fro dev. Create a deployment and expose the service.
+              deployNewApp("${appNameDev}", "${projectDevNamespc}")
+              setDcImage("${appNameDev}", "${projectDevNamespc}")
+              delDcTriggers("${appNameDev}", "${projectDevNamespc}")
+              setLivenessProb("${appNameDev}", "${projectDevNamespc}")
+              setReadinessProb("${appNameDev}", "${projectDevNamespc}")
+              rollOutDc("${appNameDev}", "${projectDevNamespc}")
+              exposeSvcExt("${appNameDev}", "${projectDevNamespc}")
+            } else {
+              echo "${appNameDev} previously deployed, rolling out new deployment..."
+              // Deployment exists, rollout latest image.
+              setDcImage("${appNameDev}", "${projectDevNamespc}")
+              rollOutDc("${appNameDev}", "${projectDevNamespc}")
+            }
+          }
+
+    // STAGE 12: Request input to continue to production deployment
+          stage("Proceed with Production stages?")  {
+            echo "Getting input if we can continue to production stages."
+            input 'Continue with the production stages?' 
+          }
+
+    // STAGE 13: Continue with production and canary when canary true.
+          stage("Canary Deployment"){
+            // If no deployment for production, start a new deployment. No canary for first deployment.
+            appCheckPrd = sh(returnStdout: true, script: "oc get dc ${appNamePrd} -o jsonpath='{ .metadata.name }' -n ${projectPrdNamespc} || true").trim()
+            if (appCheckPrd == ""){
+              echo "${appNamePrd} not deployed. Creating new deployment (no canary available for first deployment!)..."
+              // Tag image devTag --> prodTag --> latest Tag. With this we can have relationship to which developed image has been promoted to production.
+              imageTagger("${projectDevNamespc}/${appNameDev}:${devTag}", "${projectPrdNamespc}/${appNamePrd}:${devTag}", "${projectPrdNamespc}")
+              imageTagger("${projectPrdNamespc}/${appNamePrd}:${devTag}", "${projectPrdNamespc}/${appNamePrd}:latest", "${projectPrdNamespc}")
+
+              // Deploy a new application.
+              deployNewApp("${appNamePrd}", "${projectPrdNamespc}")
+              setDcImage("${appNamePrd}", "${projectPrdNamespc}")
+              delDcTriggers("${appNamePrd}", "${projectPrdNamespc}")
+              setLivenessProb("${appNamePrd}", "${projectPrdNamespc}")
+              setReadinessProb("${appNamePrd}", "${projectPrdNamespc}")
+              exposeSvcExt("${appNamePrd}", "${projectPrdNamespc}")
+              prodRolled = "true"
+
+            } else {
+              // Production already exists, now we asked for canary.
+              def goCanary = input(message: 'Go canary?', ok: 'Continue',  
+                        parameters: [booleanParam(defaultValue: true, 
+                        description: 'If you want canary split.',name: 'Go Canary?')])
+              // Set prodRolled 'false' as default value. This value used when canary deploy skipped.
+              prodRolled = "false"
+              
+              if (goCanary){
+                echo "Get canary input as ${goCanary}, executing canary..."
+                def canaryWeight = input( id: 'canaryInput', message: 'Canary traffic % to set?', 
+                  parameters: [[$class: 'TextParameterDefinition', defaultValue: '50', description: 'Canary traffic percentage', name: 'Weight']]).toInteger()
+
+                def prodWeight = input( id: 'prodInput', message: 'Production traffic % to set?', 
+                  parameters: [[$class: 'TextParameterDefinition', defaultValue: '50', description: 'Production traffic percentage', name: 'Weight']]).toInteger()
+
+                // Check if there are any canary deployment previously.
+                appCheckCan = sh(returnStdout: true, script: "oc get dc ${appNameCan} -o jsonpath='{ .metadata.name }' -n ${projectPrdNamespc} || true").trim()
+                // When no canary deployed previously, create new deployment.
+                if (appCheckCan == ""){
+                  echo "${appNameCan} not deployed. Creating new deployment..."
+
+                  imageTagger("${projectDevNamespc}/${appNameDev}:${devTag}", "${projectPrdNamespc}/${appNameCan}:${devTag}", "${projectPrdNamespc}")
+                  imageTagger("${projectPrdNamespc}/${appNameCan}:${devTag}", "${projectPrdNamespc}/${appNameCan}:latest", "${projectPrdNamespc}")
+                  deployNewApp("${appNameCan}", "${projectPrdNamespc}")
+                  setDcImage("${appNameCan}", "${projectPrdNamespc}")
+                  setLivenessProb("${appNameCan}", "${projectPrdNamespc}")
+                  setReadinessProb("${appNameCan}", "${projectPrdNamespc}")
+                  delDcTriggers("${appNameCan}", "${projectPrdNamespc}")
+                  rollOutDc("${appNameCan}", "${projectPrdNamespc}")
+                  scaleDcReplica("${appNameCan}", "${projectPrdNamespc}", "1")
+                  routePatchMain("${appNamePrd}", "${appNamePrd}",  "${projectPrdNamespc}", "${prodWeight}")
+                  routePatchAlter("${appNamePrd}", "${appNameCan}",  "${projectPrdNamespc}", "${canaryWeight}")
+
+                // If deployment exists, rollout latest image and split traffic accordingly.
+                } else {
+                  prevCanImgRef = sh(returnStdout: true, script: "oc get istag ${appNameCan}:latest -o jsonpath='{ .tag.from.name }' -n ${projectPrdNamespc}").trim()
+                  echo "${prevCanImgRef} as image rollback reference!"
+                  echo "${appNameCan} previously deployed. Tagging new image and rolling latest deployment..."
+
+                  imageTagger("${projectDevNamespc}/${appNameDev}:${devTag}", "${projectPrdNamespc}/${appNameCan}:${devTag}", "${projectPrdNamespc}")
+                  imageTagger("${projectPrdNamespc}/${appNameCan}:${devTag}", "${projectPrdNamespc}/${appNameCan}:latest", "${projectPrdNamespc}")
+                  setDcImage("${appNameCan}", "${projectPrdNamespc}")
+                  rollOutDc("${appNameCan}", "${projectPrdNamespc}")
+                  scaleDcReplica("${appNameCan}", "${projectPrdNamespc}", "1")
+                  routePatchMain("${appNamePrd}", "${appNamePrd}",  "${projectPrdNamespc}", "${prodWeight}")
+                  routePatchAlter("${appNamePrd}", "${appNameCan}",  "${projectPrdNamespc}", "${canaryWeight}")
+                
+                }
+              // When canary not selected. Deploy straight to production and ensure traffic 100% directed to it.
+              } else {
+                // Deploy production with 100% traffic.
+                prevPrdImgRef = sh(returnStdout: true, script: "oc get istag ${appNamePrd}:latest -o jsonpath='{ .tag.from.name }' -n ${projectPrdNamespc}").trim()
+                echo "${prevPrdImgRef} as image rollback reference!"
+
+                imageTagger("${projectDevNamespc}/${appNameDev}:${devTag}", "${projectPrdNamespc}/${appNamePrd}:${devTag}", "${projectPrdNamespc}")
+                imageTagger("${projectPrdNamespc}/${appNamePrd}:${devTag}", "${projectPrdNamespc}/${appNamePrd}:latest", "${projectPrdNamespc}")
+                setDcImage("${appNamePrd}", "${projectPrdNamespc}")
+                rollOutDc("${appNamePrd}", "${projectPrdNamespc}")
+                routePatchMain("${appNamePrd}", "${appNamePrd}",  "${projectPrdNamespc}", 100)
+                routePatchAlter("${appNamePrd}", "${appNameCan}",  "${projectPrdNamespc}", 0)
+                prodRolled = "true"
+                }
+              }             
+            }
+          stage("Promote canary as production or rollback?"){
+            if (prodRolled != "true"){
+              def rollBackCanary = input(message: 'Do we need to rollback canary deployment ', ok: 'Continue',  
+                        parameters: [booleanParam(defaultValue: true, 
+                        description: 'If you want to switch back traffic to production 100% from canary testing.',name: 'Swich back traffic to production?')])
+              if(rollBackCanary){
+                echo "Canary rollback selected, switching back traffic to current production..."
+                routePatchMain("${appNamePrd}", "${appNamePrd}",  "${projectPrdNamespc}", 100)
+                routePatchAlter("${appNamePrd}", "${appNameCan}",  "${projectPrdNamespc}", 0)
+                scaleDcReplica("${appNameCan}", "${projectPrdNamespc}", "0")
+
+              } else {
+                def goProd = input(message: 'Continue to production from canary release? ', ok: 'Continue',  
+                        parameters: [booleanParam(defaultValue: true, 
+                        description: 'Promote canary as production.',name: 'Promote canary to production?')])
+                if(goProd){
+                  echo "Promoting canary to production..."
+                  prevPrdImgRef = sh(returnStdout: true, script: "oc get istag ${appNamePrd}:latest -o jsonpath='{ .tag.from.name }' -n ${projectPrdNamespc}").trim()
+                  echo "${prevPrdImgRef} as image rollback reference!"
+                  imageTagger("${projectPrdNamespc}/${appNameCan}:${devTag}", "${projectPrdNamespc}/${appNamePrd}:latest", "${projectPrdNamespc}")
+                  setDcImage("${appNamePrd}", "${projectPrdNamespc}")
+                  rollOutDc("${appNamePrd}", "${projectPrdNamespc}")
+                  routePatchMain("${appNamePrd}", "${appNamePrd}",  "${projectPrdNamespc}", 100)
+                  routePatchAlter("${appNamePrd}", "${appNameCan}",  "${projectPrdNamespc}", 0)
+                  echo "Scaling down canary since promoted to production..."
+                  scaleDcReplica("${appNameCan}", "${projectPrdNamespc}", "0")
+                }
+              }
+            }
+          }
+          stage("Rollback production?"){
+            if (prodRolled == "true"){
+              def rollBackProd = input(message: 'Do we need to rollback production deployment', ok: 'Continue',  
+                        parameters: [booleanParam(defaultValue: true, 
+                        description: 'If you want to rollback production to previous image.',name: 'Rollback production?')])
+              if(rollBackProd){
+                echo "Rolling back production deployment..."
+                imageTagger("${prevPrdImgRef}", "${projectPrdNamespc}/${appNamePrd}:latest", "${projectPrdNamespc}")
+                setDcImage("${appNamePrd}", "${projectPrdNamespc}")
+                rollOutDc("${appNamePrd}", "${projectPrdNamespc}")
+              }
+            }
+          } 
+        }
+      }
+    }
+
+
+// Convenience Functions to read variables from the pom.xml
+def getVersionFromPom(pom) {
+  def matcher = readFile(pom) =~ '<version>(.+)</version>'
+  matcher ? matcher[0][1] : null
+}
+def getGroupIdFromPom(pom) {
+  def matcher = readFile(pom) =~ '<groupId>(.+)</groupId>'
+  matcher ? matcher[0][1] : null
+}
+def getArtifactIdFromPom(pom) {
+  def matcher = readFile(pom) =~ '<artifactId>(.+)</artifactId>'
+  matcher ? matcher[0][1] : null
+}
+
+def deployNewApp(appName, namespace) {
+  sh "oc new-app --name=${appName} ${appName}:latest -n ${namespace} "
+}
+
+def imageTagger(srcImageTag, dstImageTag, nameSpace){
+  sh "oc tag ${srcImageTag} ${dstImageTag} -n ${nameSpace}"
+}
+
+def setDcImage(appName, nameSpace){
+  sh "oc set image dc/${appName} ${appName}=${appName}:latest --source=imagestreamtag -n ${nameSpace}"
+}
+
+def delDcTriggers(appName, nameSpace){
+  sh "oc set triggers dc/${appName} --remove-all -n ${nameSpace}"
+}
+
+def rollOutDc(appName, nameSpace){
+  sh "oc rollout latest dc/${appName} -n ${nameSpace} || true"
+}
+
+def exposeSvcExt(appName, nameSpace){
+  sh "oc expose service ${appName} --name=${appName} -n ${nameSpace}"
+}
+
+def scaleDcReplica(appName, nameSpace, noOfRep){
+  sh "oc scale --replicas=${noOfRep} dc/${appName} -n ${nameSpace} || true"
+}
+
+def routePatchMain(appName, svcName, nameSpace, trafficWeight){
+  sh "oc patch route ${appName} -p '{\"spec\": {\"to\": {\"name\": \"${svcName}\", \"weight\" : ${trafficWeight} }}}' -n ${nameSpace} || true "
+}
+
+def routePatchAlter(appName, svcName, nameSpace, trafficWeight){
+  sh "oc patch route ${appName} -p '{\"spec\": {\"alternateBackends\": [{\"name\": \"${svcName}\", \"weight\" : ${trafficWeight} }]}}' -n ${nameSpace} || true"
+}
+
+def setLivenessProb(appName, nameSpace){
+  sh "oc set probe  -n ${nameSpace} dc/${appName} --liveness -- echo ok"
+}
+
+def setReadinessProb(appName, nameSpace){
+  sh "oc set probe -n ${nameSpace} dc/${appName} --readiness --get-url=http://:8080/healthz "  
+}
