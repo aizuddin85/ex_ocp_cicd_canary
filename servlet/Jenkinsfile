@@ -96,7 +96,7 @@ podTemplate(
 
             if (appCheck == "") { 
               echo "${appNameDev} not deployed. Creating new deployment..."
-              // No latest deployment fro dev. Create a deployment and expose the service.
+              // No latest deployment for dev. Create a deployment and expose the service.
               deployNewApp("${appNameDev}", "${projectDevNamespc}")
               setDcImage("${appNameDev}", "${projectDevNamespc}")
               delDcTriggers("${appNameDev}", "${projectDevNamespc}")
